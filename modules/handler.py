@@ -62,12 +62,18 @@ class Handler:
             try:
                 client, addr = self.server.accept()
                 try:
-                    beacon = client.recv(4096)
-                    if not beacon:
+                    raw = client.recv(4096)
+                    if not raw or len(raw) < 5:
+                        print(f" {_colorize('[!]', R)} Bad beacon from {addr[0]}: got {len(raw) if raw else 0} bytes")
                         client.close()
                         continue
-                    decrypt(self.key, beacon)
-                except Exception:
+                    plen = int.from_bytes(raw[:4], "big")
+                    enc = raw[4:4 + plen]
+                    print(f" {_colorize('[*]', B)} Beacon from {addr[0]}: {plen} bytes encrypted")
+                    decrypt(self.key, enc)
+                    print(f" {_colorize('[*]', G)} Beacon decrypted OK")
+                except Exception as e:
+                    print(f" {_colorize('[!]', R)} Beacon decrypt failed from {addr[0]}: {e}")
                     client.close()
                     continue
 

